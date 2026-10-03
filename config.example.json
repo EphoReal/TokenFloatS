@@ -1,0 +1,11 @@
+{
+  "poll_seconds": 60,
+  "paths": {
+    "hermes": "%LOCALAPPDATA%\\hermes\\state.db",
+    "opencode": "~/.local/share/opencode/opencode.db",
+    "cline": "~/.cline/data/sessions",
+    "dsh": "~/.dsh/storages/session_projcache",
+    "codex": "~/.codex/sessions",
+    "claude_code": "~/.claude/projects"
+  }
+}

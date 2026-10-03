@@ -1,0 +1,33 @@
+# Byte-compiled / cache
+__pycache__/
+state/
+*.py[cod]
+*$py.class
+
+# Virtual environments - never commit these
+venv/
+.venv/
+env/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Local runtime output
+*.log
+tokenfloats.log
+out.png
+
+# README screenshots live in docs/ and ARE committed
+!docs/*.png
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Local config overrides (paths are machine specific)
+config.local.json
