@@ -196,20 +196,32 @@ def main() -> int:
               + t["cache_read"] + t["cache_write"])
         check("fresh excludes cache", t["fresh"],
               t["input"] + t["output"] + t["reasoning"])
+        check("a readable source counts as installed",
+              all(u.installed for u in data), True)
+
+        # The panel shows a session count next to a total, and drives the per-run
+        # figure off the per-session snapshots. If the two disagree, one of the
+        # numbers on screen is describing a different set of sessions than the
+        # other, so they are required to agree source by source.
+        for u in data:
+            check(f"{u.source}: session count matches its snapshot",
+                  u.sessions, len(C.SNAPSHOT_FNS[u.source](cfg)))
 
         # a missing source must degrade, not raise
         empty = {"paths": {k: os.path.join(tmp, "nope", k) for k in cfg["paths"]}}
         for u in C.collect_all(empty):
             check(f"missing {u.source} degrades", u.ok, False)
             check(f"missing {u.source} has error", bool(u.error), True)
+            # the panel hides a source that is not installed, but still shows a
+            # source that is present and unreadable: the flag is what separates them
+            check(f"missing {u.source} is marked not installed", u.installed, False)
 
         # detection: every configured fixture path exists, and the second
-        # candidate for opencode is reported as also-present rather than lost
+        # candidate for opencode is reported as also-present rather than lost.
+        # detect_all reports the displayed names, not the short config keys.
         found, missing = C.detect_all(cfg)
-        # detect reports the names the panel shows; cfg is keyed by the short
-        # name, so compare through that mapping
-        check("detect finds all six", sorted(found),
-              sorted(C.display_name(k) for k in cfg["paths"]))
+        check("detect finds all six",
+              sorted(found), sorted(C.display_name(k) for k in cfg["paths"]))
         check("detect has no missing", sorted(missing), [])
 
         override = dict(cfg)
@@ -232,15 +244,45 @@ def main() -> int:
               C.session_growth(grown, base)["Hermes"], 5100)
         check("growth with no change is zero",
               C.session_growth(base, base)["Hermes"], 0)
-        check("growth without a launch baseline is zero",
-              C.session_growth(base, {})["Hermes"], 0)
-        check("growth ignores a session created after launch",
+        check("growth with no baseline for the session counts its value",
+              C.session_growth(base, {})["Hermes"], sum(base["Hermes"]["s1"])
+              + sum(base["Hermes"]["s2"]))
+        # A session that appears after launch is either brand new (starts at
+        # zero, so its total IS its growth) or resumed from history (arrives
+        # already large). Both are counted - see session_growth's docstring.
+        check("growth counts a session absent from the baseline",
               C.session_growth({"Hermes": {"s1": [1, 0, 0, 0, 0],
                                            "new": [7, 0, 0, 0, 0]}},
-                               {"Hermes": {"s1": [1, 0, 0, 0, 0]}})["Hermes"], 0)
+                               {"Hermes": {"s1": [1, 0, 0, 0, 0]}})["Hermes"], 7)
+        # The reported regression: resuming a DSH conversation whose session was
+        # not in the launch baseline must not silently lose its usage.
+        resumed = {"DeepSeek Harness": {
+            "session-711bb9df": [42314, 13962, 857856, 0, 0]}}
+        check("resumed session with no baseline entry is counted",
+              C.session_growth(resumed, {"DeepSeek Harness": {}})["DeepSeek Harness"],
+              42314 + 13962 + 857856)
+        check("resumed session grows from its full total afterwards",
+              C.session_growth(
+                  {"DeepSeek Harness": {"session-711bb9df":
+                                        [42314, 13962, 957856, 0, 0]}},
+                  {"DeepSeek Harness": {}})["DeepSeek Harness"],
+              42314 + 13962 + 957856)
         check("growth on a reset session counts its current value",
               C.session_growth({"Hermes": {"s1": [10, 0, 0, 0, 0]}},
                                base)["Hermes"], 10)
+        # A reset must be read the same way in every bucket: reading "reset" from
+        # bucket 0 and then differencing the rest under-reports the session.
+        check("a reset counts every bucket, not just the first",
+              C.session_growth({"Hermes": {"s1": [10, 20, 0, 0, 0]}},
+                               {"Hermes": {"s1": [900, 800, 0, 0, 0]}})["Hermes"], 30)
+        # A baseline entry that is not a bucket list must not raise. The old form
+        # of this test used `if not old`, which skipped it; treat it as no baseline.
+        check("a malformed baseline entry does not raise",
+              C.session_growth({"Hermes": {"s1": [5, 5, 0, 0, 0]}},
+                               {"Hermes": {"s1": 0}})["Hermes"], 10)
+        check("an empty baseline list counts the session",
+              C.session_growth({"Hermes": {"s1": [5, 5, 0, 0, 0]}},
+                               {"Hermes": {"s1": []}})["Hermes"], 10)
 
         state: dict = {}
         C.arm_counter({"Hermes": {"s1": [1000, 0, 10_000, 0, 0]}})
@@ -259,6 +301,51 @@ def main() -> int:
         check("the record carries date and time",
               len(runs[0]["start"]) == 16 and runs[0]["start"][4] == "-", True)
         check("the record holds this run's figure", runs[0]["total"], 2500)
+
+        # ---- the cached, resumable scan of the append-only rollout logs.
+        # Codex logs are tens of MiB each, so they are read incrementally; the
+        # figure must still be the largest cumulative record seen.
+        log = os.path.join(tmp, "rollout-cache.jsonl")
+
+        def append(total: int) -> None:
+            rec = {"type": "event_msg", "payload": {"type": "token_count", "info": {
+                "total_token_usage": {
+                    "input_tokens": total, "cached_input_tokens": total // 2,
+                    "cache_write_input_tokens": 0, "output_tokens": total // 10,
+                    "reasoning_output_tokens": 0, "total_tokens": total * 3 // 2}}}}
+            with open(log, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(rec) + "\n")
+            time.sleep(0.01)              # let mtime advance before the next poll
+
+        C._FILE_RESULTS.clear()
+        C._CODEX_OFFSET.clear()
+        C._CODEX_TOTAL.clear()
+        append(1000)
+        first = C._codex_file_buckets(log)
+        check("cache: first read takes the record", first.get("input_tokens"), 1000)
+
+        # A repeat read of an unchanged file must be served from cache.
+        check("cache: unchanged file returns the same figure",
+              C._codex_file_buckets(log), first)
+
+        append(4000)
+        grown = C._codex_file_buckets(log)
+        check("cache: a larger appended record wins", grown.get("input_tokens"), 4000)
+
+        # A later but SMALLER record must not lower the cumulative figure.
+        append(7)
+        check("cache: a smaller later record cannot lower it",
+              C._codex_file_buckets(log).get("input_tokens"), 4000)
+
+        # Truncation (a rewritten log) must be noticed, not served from cache.
+        with open(log, "w", encoding="utf-8") as fh:
+            pass
+        append(42)
+        check("cache: a truncated log is re-read from the top",
+              C._codex_file_buckets(log).get("input_tokens"), 42)
+        C._FILE_RESULTS.clear()
+        C._CODEX_OFFSET.clear()
+        C._CODEX_TOTAL.clear()
 
     print()
     if failures:

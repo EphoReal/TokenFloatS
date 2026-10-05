@@ -4,6 +4,69 @@ All notable changes to TokenFloatS are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-10-05
+
+### Fixed
+
+- **Resuming an older conversation no longer loses its usage.** A session absent
+  from the launch baseline contributed nothing, on the assumption that it was
+  newly created. A resumed session arrives already carrying its earlier totals,
+  so it was skipped entirely and its tokens never appeared in `THIS RUN`. Such a
+  session is now counted in full the first time it is seen; the earlier part of
+  its history is therefore reported as part of this run, which is the deliberate
+  trade (see the README). Every source was affected, since a tool's session list
+  is itself a partial cache.
+- **Quitting no longer raises.** `finish_counter` was called on exit but never
+  imported, so every quit from the tray menu raised `NameError` inside the
+  `finally` block. The visible effect was that a clean exit never wrote its end
+  time, and the next launch then had to mark the record `unclean`.
+- **Missing sources are hidden again.** `Panel.refresh` called an undefined
+  `_is_absent`. The distinction between "not installed" and "installed but
+  unreadable" is now carried explicitly by `Usage.installed`, set by each
+  collector, instead of being inferred from an error string.
+- **A re-keyed or reset session is now counted in full, not by its first bucket
+  alone.** When a counter went backwards the code concluded the session had been
+  reset and added bucket 0's whole value, while still differencing buckets 1-4 —
+  two readings of one session, which under-reported it. A reset from
+  `[900, 800]` to `[10, 20]` is 30 tokens of new usage; it used to report 10. A
+  baseline entry that is not a bucket list is also handled rather than raising.
+- **Session counts now match the data behind them.** The figure beside
+  `THIS RUN` disagreed with the per-session snapshots that produce it for three
+  sources: Hermes counted rows in the `sessions` table rather than sessions with
+  recorded usage (18 against 25), DeepSeek Harness counted sessions that never
+  consumed anything (55 against 43), and Claude Code counted transcripts whose
+  usage records were all zero (2 against 0). All six sources now count the
+  sessions their snapshots hold, and the test suite asserts it.
+
+### Changed
+
+- **Polling is 10 times cheaper, and the interval defaults to 10 seconds**
+  (was 60). Re-reading the append-only logs dominated every poll: 46 Codex
+  rollout files totalling 135.6 MiB, of which 3.6 MiB of lines held token data,
+  cost ~230 ms of a ~500 ms poll and were walked twice per poll. Each file's
+  result is now cached against `(mtime, size)`, an unchanged file is not read at
+  all, and a Codex log is read from where the last read stopped, keeping the
+  largest cumulative record seen. A warm poll went from ~510 ms to ~48 ms,
+  measured at ~10 ms of CPU — about 0.1 % of one core at the default interval.
+- The poll interval is configurable via `config.json` (`poll_seconds`) or
+  `--interval SECONDS`, with a floor of 2 seconds.
+- The poll thread waits on a single `threading.Event`, so quitting no longer has
+  to drain a sleep loop and now returns immediately.
+- DeepSeek Harness: the aggregate rollup at
+  `~/.dsh/storages/session_projcache.json` is explicitly not read. It is a
+  partial index — 28 of 55 sessions, 7 of them staler than the session file — so
+  the per-session files, which are a superset by id, are the sole source. The
+  previous code looked for that file inside the directory, where it never
+  existed, so this only makes the existing behaviour explicit.
+- README: documents the bucket semantics, per-run accounting, configuration,
+  the poll interval, the incremental reads, and troubleshooting. Added a test
+  section and `config.example.json` now ships `poll_seconds: 10`.
+
+### Removed
+
+- Dead `_today()` helper, and a comment referring to `day_slice()`, a per-day
+  figure removed before 1.0.0.
+
 ## [1.0.0] - 2026-10-03
 
 First release.
