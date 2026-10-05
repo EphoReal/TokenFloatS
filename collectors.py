@@ -200,6 +200,144 @@ MAX_RUNS = 400                     # ~400 runs; a few tens of KB
 MAX_SESSIONS_PER_SOURCE = 400
 
 
+# ============================================ append-only log file caching
+#
+# Codex and Claude Code keep one growing log file per session, and a single
+# Codex rollout log reaches tens of MiB. Reading them from the top on every poll
+# means reading hundreds of MiB to extract a few KiB of usage: measured on this
+# machine, 46 rollout files of 135.6 MiB hold only 3.6 MiB of token lines, and
+# that full scan was ~230 ms of a ~500 ms poll, paid twice per poll because the
+# lifetime totals and the per-session snapshots each walk the same files.
+#
+# So each file's result is cached against (mtime, size). An untouched file is
+# never read again; a file that grew is read once instead of twice; and a Codex
+# log (whose usage records are cumulative) is read from where the last read
+# stopped rather than from the top.
+#
+# The cache is keyed by absolute path, so two configs - or a test's temp
+# fixtures - can never collide. It holds small dicts only; nothing retains file
+# contents.
+_FILE_RESULTS: dict[tuple, dict] = {}
+
+
+def _file_stamp(path: str) -> tuple[int, int] | None:
+    """(mtime_ns, size) for a file, or None when it cannot be stat'ed."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_mtime_ns, st.st_size)
+
+
+def _cached_file_scan(path: str, read_fn, stamp_extra=None) -> dict:
+    """`read_fn(open_file) -> dict` cached until the file's stamp changes.
+
+    read_fn is handed the open file and returns the buckets it found; it keeps
+    whatever offset state it needs in the module-level dicts below.
+    stamp_extra is folded into the cache key by callers whose read is
+    incremental, so a stale entry can never be reached for a different reading
+    position even when the filesystem's mtime resolution is coarse.
+    """
+    stamp = _file_stamp(path)
+    if stamp is None:
+        return {}
+    key = (os.path.abspath(path), stamp[0], stamp[1], stamp_extra)
+    hit = _FILE_RESULTS.get(key)
+    if hit is not None:
+        return hit
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            result = read_fn(fh)
+    except OSError:
+        return {}
+    result = result or {}
+    if len(_FILE_RESULTS) > 2048:              # bounded: drop the oldest half
+        for old in list(_FILE_RESULTS)[:1024]:
+            _FILE_RESULTS.pop(old, None)
+    _FILE_RESULTS[key] = result
+    return result
+
+
+# Offset state for the incremental Codex scan, keyed by absolute path.
+_CODEX_OFFSET: dict[str, int] = {}
+# The winning record so far, held as (total_tokens, buckets). The comparison key
+# has to be kept alongside the buckets: comparing a new record against
+# `latest["total_tokens"]` would fail, because total_tokens is deliberately not
+# one of the bucket names carried forward.
+_CODEX_TOTAL: dict[str, tuple[int, dict]] = {}
+
+# Bucket names under which Codex reports usage in a token_count record.
+CODEX_BUCKETS = ("input_tokens", "output_tokens", "cached_input_tokens",
+                 "cache_write_input_tokens", "reasoning_output_tokens")
+
+
+def _codex_read_from(fh, start: int) -> dict:
+    """Scan from byte offset `start` and fold the result into the running max.
+
+    Codex writes total_token_usage as a CUMULATIVE per-session figure, so across
+    polls the largest record wins; earlier bytes therefore never need revisiting.
+    A later but smaller record must not lower the figure, so the record already
+    held is compared against the new ones by its own total_tokens.
+    """
+    path = getattr(fh, "name", "")
+    key = os.path.abspath(path)
+    prior = _CODEX_TOTAL.get(key)
+    if prior:
+        best_total, latest = prior[0], dict(prior[1])
+    else:
+        best_total, latest = -1, None
+    fh.seek(start)
+    for line in fh:
+        if '"token_count"' not in line:
+            continue
+        try:
+            d = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        pl = d.get("payload") or {}
+        if pl.get("type") != "token_count":
+            continue
+        tcu = (pl.get("info") or {}).get("total_token_usage")
+        if not isinstance(tcu, dict) or "total_tokens" not in tcu:
+            continue
+        if tcu["total_tokens"] >= best_total:
+            best_total = tcu["total_tokens"]
+            latest = {k: tcu.get(k) or 0 for k in CODEX_BUCKETS}
+    try:
+        _CODEX_OFFSET[key] = fh.tell()
+    except (OSError, ValueError):
+        _CODEX_OFFSET[key] = 0
+    if latest:
+        _CODEX_TOTAL[key] = (best_total, dict(latest))
+    return latest or {}
+
+
+def _codex_file_buckets(path: str) -> dict:
+    """Latest cumulative usage in one rollout log, resuming from the last read.
+
+    Skips the file entirely when it has not grown since the last read - that is
+    the common case for the tens of rollouts that are no longer active - and
+    otherwise reads only the bytes appended since. Reading a tail is cheap; the
+    JSON decoding is what costs, and that now happens once per new record rather
+    than once per poll per file.
+    """
+    key = os.path.abspath(path)
+    start = _CODEX_OFFSET.get(key, 0)
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return {}
+    if start > size:                      # truncated or replaced: start over
+        start = 0
+        _CODEX_TOTAL.pop(key, None)
+    # An unchanged file resolves to the same cache key and is not read again.
+    # The stamp includes `start` so a stale entry cannot be reached from a
+    # different reading position, even if mtime resolution is coarse.
+    return _cached_file_scan(path, lambda fh: _codex_read_from(fh, start),
+                             stamp_extra=start)
+
+
+
 def _state_dir() -> str:
     """Where the run record lives.
 
@@ -317,29 +455,53 @@ def close_stale_runs() -> int:
 def session_growth(current: dict, previous: dict) -> dict:
     """Per-source growth between two sets of per-session cumulative snapshots.
 
-    A session missing from `previous` contributes nothing: it either started
-    after the launch snapshot, in which case a later poll picks up its growth,
-    or it predates this run and its earlier consumption must not be reported as
-    if it happened now.
+    When a session is absent from `previous`, its whole current value is counted.
+    A missing baseline entry cannot be told apart from a brand-new session, and
+    treating it as new is the only reading that does not silently lose usage:
+
+      * a session created after launch starts at zero, so counting its total IS
+        its growth - there is nothing earlier to double count;
+      * a session resumed from history arrives carrying its earlier totals. The
+        part spent before this run gets reported as part of this run, which
+        overstates one figure. That is the deliberate trade: under-reporting
+        (skipping the session outright) was invisible and wrong, while this
+        shows up as a one-off larger number the user can see and judge.
+
+    This matters in practice because a source's session list is itself a
+    partial cache: resuming a conversation it no longer holds produces exactly
+    this shape - a session that is already large the first time it is seen.
+    The caller's high-water mark keeps that one-off figure from ever decreasing,
+    so the overstatement persists for the life of the run rather than decaying.
+
+    A whole value is also what a re-keyed or reset session gets. Reading "the
+    session was reset" from one counter and then accounting the others as plain
+    differences mixes two readings of the same session and under-reports it: a
+    reset from [900, 800] to [10, 20] is 30 tokens of new usage, not the 10 that
+    differencing bucket 0 alone would give.
     """
     out: dict[str, int] = {}
     for source, sessions in (current or {}).items():
         before = (previous or {}).get(source) or {}
         n = 0
         for key, vals in sessions.items():
+            total = sum(vals)
             old = before.get(key)
-            if not old:
+            if not isinstance(old, list) or not old:
+                # Not seen at launch, or nothing usable recorded for it: what it
+                # holds now is what it has consumed since.
+                n += total
+                continue
+            if vals and vals[0] > 0 and vals[0] < (old[0] if old else 0):
+                # The session's own counter went backwards, so its key was
+                # re-used or the session was reset. The whole session is new
+                # usage now, exactly as in the not-seen-at-launch case above.
+                n += total
                 continue
             for idx in range(5):
                 cur = vals[idx] if idx < len(vals) else 0
                 prior = old[idx] if idx < len(old) else 0
                 if cur > prior:
                     n += cur - prior
-                elif cur > 0 and idx == 0 and cur < prior:
-                    # counters went backwards: the tool re-keyed or reset the
-                    # session. Its whole current value is new, and unlike the
-                    # missing-key case we CAN see it, so count it.
-                    n += cur
         out[source] = n
     return out
 
@@ -372,9 +534,11 @@ def since_launch(current: dict) -> dict:
 
 # ------------------------------------------------- per-session snapshots
 #
-# day_slice() needs, per source, the cumulative token counts of every session
-# keyed by something stable. Lifetime totals are computed from exactly the same
-# numbers, so collect_all() and the snapshots can never disagree.
+# Per-run accounting needs, for each source, the cumulative token counts of
+# every session, keyed by something stable across polls. The lifetime totals are
+# computed from exactly the same numbers - each source's collector and its
+# snapshot read one shared function - so the two figures the panel shows can
+# never disagree.
 
 def _snapshot_hermes(config: dict | None = None) -> dict:
     db = path_for("hermes", config)
@@ -487,53 +651,55 @@ def _snapshot_cline(config: dict | None = None) -> dict:
     return out
 
 
-def _snapshot_dsh(config: dict | None = None) -> dict:
-    root = path_for("dsh", config)
-    agg = os.path.join(root, "session_projcache.json")
-    per_dir = os.path.join(root, "sessions")
-    if not os.path.exists(agg) and not os.path.isdir(per_dir):
+def _dsh_sessions(config: dict | None = None) -> dict[str, list[int]]:
+    """Per-session DSH usage: {session_id: [in, out, cache_read, cache_write, 0]}.
+
+    Only sessions that actually consumed something are returned. DSH creates a
+    session file as soon as a conversation exists, so a store holds many
+    zero-token entries; counting those as "sessions" would overstate what the
+    panel says it is reading.
+
+    One basis for both the lifetime totals and the per-session snapshots, so the
+    two figures the panel shows can never disagree.
+
+    session_projcache.json - the rollup one level up, at ~/.dsh/storages/ - is
+    deliberately NOT read. It is a partial index: measured here it held 28 of the
+    55 sessions, and for 7 sessions it held a staler figure than the session file
+    (e.g. 2,929,277 against 5,404,838). The per-session files are a superset by
+    id and are rewritten every turn, so they alone are authoritative.
+    """
+    per_dir = os.path.join(path_for("dsh", config), "sessions")
+    if not os.path.isdir(per_dir):
         return {}
 
-    def totals_of(rows: dict):
-        tu = rows.get("tokenUsage") or {}
-        val = tu.get("val") if isinstance(tu.get("val"), dict) else tu
-        return val.get("totals") if isinstance(val, dict) else None
-
-    seen: dict[str, tuple[int, dict]] = {}
-    if os.path.exists(agg):
-        try:
-            with open(agg, encoding="utf-8") as fh:
-                doc = json.load(fh)
-            for sid, sess in ((doc.get("tables") or {}).get("sessions") or {}).items():
-                t = totals_of((sess or {}).get("rows") or {})
-                if isinstance(t, dict):
-                    seen[sid] = (0, t)
-        except (OSError, json.JSONDecodeError):
-            pass
+    out: dict[str, list[int]] = {}
     for f in glob.glob(os.path.join(per_dir, "*.json")):
         try:
             with open(f, encoding="utf-8") as fh:
-                d = json.load(fh)
-            t = totals_of(((d.get("record") or {}).get("rows") or {}))
-            if not isinstance(t, dict):
-                continue
-            sid = os.path.splitext(os.path.basename(f))[0]
-            try:
-                mt = int(os.path.getmtime(f))
-            except OSError:
-                mt = 0
-            if mt >= seen.get(sid, (-1,))[0]:
-                seen[sid] = (mt, t)
+                doc = json.load(fh)
         except (OSError, json.JSONDecodeError):
             continue
-
-    out: dict[str, list[int]] = {}
-    for sid, (_mt, t) in seen.items():
-        acc = [t.get("uncachedInputTokens") or 0, t.get("outputTokens") or 0,
-               t.get("cacheReadTokens") or 0, t.get("cacheWriteTokens") or 0, 0]
+        rows = ((doc.get("record") or {}).get("rows") or {})
+        # tokenUsage is a SIBLING of sessionStats under rows, wrapped in
+        # ver/seq/val - it is NOT nested inside sessionStats, and the input field
+        # is uncachedInputTokens, not inputTokens.
+        tu = rows.get("tokenUsage") or {}
+        val = tu.get("val") if isinstance(tu.get("val"), dict) else tu
+        totals = val.get("totals") if isinstance(val, dict) else None
+        if not isinstance(totals, dict):
+            continue
+        acc = [totals.get("uncachedInputTokens") or 0,
+               totals.get("outputTokens") or 0,
+               totals.get("cacheReadTokens") or 0,
+               totals.get("cacheWriteTokens") or 0,
+               0]
         if any(acc):
-            out[sid] = acc
+            out[os.path.splitext(os.path.basename(f))[0]] = acc
     return out
+
+
+def _snapshot_dsh(config: dict | None = None) -> dict:
+    return _dsh_sessions(config)
 
 
 def _snapshot_codex(config: dict | None = None) -> dict:
@@ -542,26 +708,9 @@ def _snapshot_codex(config: dict | None = None) -> dict:
         return {}
     out: dict[str, list[int]] = {}
     for f in glob.glob(os.path.join(root, "**", "*.jsonl"), recursive=True):
-        latest = None
-        try:
-            with open(f, encoding="utf-8", errors="replace") as fh:
-                for line in fh:
-                    if '"token_count"' not in line:
-                        continue
-                    try:
-                        d = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    pl = d.get("payload") or {}
-                    if pl.get("type") != "token_count":
-                        continue
-                    tcu = (pl.get("info") or {}).get("total_token_usage")
-                    if not isinstance(tcu, dict) or "total_tokens" not in tcu:
-                        continue
-                    if latest is None or tcu["total_tokens"] >= latest["total_tokens"]:
-                        latest = tcu
-        except OSError:
-            continue
+        # Same cached scan as collect_codex, so the two passes in one poll read
+        # each rollout log at most once between them.
+        latest = _codex_file_buckets(f)
         if not latest:
             continue
         out[os.path.basename(f)] = [
@@ -665,6 +814,11 @@ class Usage:
     sessions: int = 0
     run: int = 0
     note: str = ""
+    # False only when the source's store is simply not on this machine. The
+    # panel hides those rows instead of showing red text, while a source that is
+    # present but unreadable keeps its inline error. An error string cannot carry
+    # that distinction reliably, so it is stated outright.
+    installed: bool = True
 
     @property
     def total(self) -> int:
@@ -697,16 +851,13 @@ def _ro(path: str) -> sqlite3.Connection:
     return sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2)
 
 
-def _today() -> str:
-    return datetime.now().strftime("%Y-%m-%d")
-
-
 # --------------------------------------------------------------- Hermes
 def collect_hermes(config: dict | None = None) -> Usage:
     u = Usage(source="Hermes")
     db = path_for("hermes", config)
     if not os.path.exists(db):
         u.error = "state.db not found"
+        u.installed = False
         return u
     try:
         con = _ro(db)
@@ -719,7 +870,18 @@ def collect_hermes(config: dict | None = None) -> Usage:
             FROM session_model_usage""").fetchone()
         u.input, u.output, u.cache_read, u.cache_write = r["i"], r["o"], r["cr"], r["cw"]
         u.reasoning, u.api_calls = r["rs"], r["calls"]
-        u.sessions = cur.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+        # Counted on the same axis the snapshot uses - one session+model key per
+        # row group - and only where tokens were actually recorded. "sessions"
+        # then means "sessions this app can see usage for", which is what the
+        # panel's session figure claims, and it cannot disagree with the
+        # per-session snapshots that drive the per-run figure.
+        u.sessions = cur.execute("""
+            SELECT COUNT(*) FROM (
+                SELECT session_id, model FROM session_model_usage
+                GROUP BY session_id, model
+                HAVING SUM(input_tokens) + SUM(output_tokens)
+                     + SUM(cache_read_tokens) + SUM(cache_write_tokens)
+                     + SUM(reasoning_tokens) > 0)""").fetchone()[0]
         cost = cur.execute(
             "SELECT COALESCE(SUM(estimated_cost_usd),0) e,"
             " COALESCE(SUM(actual_cost_usd),0) a FROM session_model_usage").fetchone()
@@ -739,6 +901,7 @@ def collect_opencode(config: dict | None = None) -> Usage:
     db = path_for("opencode", config)
     if not os.path.exists(db):
         u.error = "opencode.db not found"
+        u.installed = False
         return u
     try:
         con = _ro(db)
@@ -772,6 +935,7 @@ def collect_cline(config: dict | None = None) -> Usage:
     root = path_for("cline", config)
     if not os.path.isdir(root):
         u.error = "no ~/.cline/data/sessions"
+        u.installed = False
         return u
     try:
         for d in glob.glob(os.path.join(root, "*")):
@@ -810,62 +974,25 @@ def collect_cline(config: dict | None = None) -> Usage:
 
 # --------------------------------------------------------------- DeepSeek Harness
 def collect_dsh(config: dict | None = None) -> Usage:
-    """Two stores, newest wins per session id:
-      - session_projcache.json          aggregate rollup
-      - session_projcache/sessions/*.json per-session, rewritten every turn,
-        so its mtime is the right activity date
-    tokenUsage is a SIBLING of sessionStats under rows, wrapped in ver/seq/val -
-    it is NOT nested inside sessionStats, and the field is uncachedInputTokens,
-    not inputTokens.
+    """Sessions under ~/.dsh/storages/session_projcache/sessions/*.json.
+
+    Every session file is rewritten each turn with its own cumulative totals, so
+    the lifetime figure is the sum over sessions and the session key doubles as
+    the identity used for per-run differencing. See _dsh_sessions for why the
+    aggregate rollup next to the directory is not used, and for the field layout.
     """
     u = Usage(source="DeepSeek Harness")
-    root = path_for("dsh", config)
-    agg = os.path.join(root, "session_projcache.json")
-    per_dir = os.path.join(root, "sessions")
-    if not os.path.exists(agg) and not os.path.isdir(per_dir):
+    per_dir = os.path.join(path_for("dsh", config), "sessions")
+    if not os.path.isdir(per_dir):
         u.error = "session_projcache not found"
+        u.installed = False
         return u
-
-    def totals_of(rows: dict):
-        tu = rows.get("tokenUsage") or {}
-        val = tu.get("val") if isinstance(tu.get("val"), dict) else tu
-        return val.get("totals") if isinstance(val, dict) else None
-
     try:
-        seen: dict[str, tuple[int, dict]] = {}
-        if os.path.exists(agg):
-            with open(agg, encoding="utf-8") as fh:
-                doc = json.load(fh)
-            for sid, sess in ((doc.get("tables") or {}).get("sessions") or {}).items():
-                totals = totals_of((sess or {}).get("rows") or {})
-                if isinstance(totals, dict):
-                    seen[sid] = (0, totals)
-        for f in glob.glob(os.path.join(per_dir, "*.json")):
-            try:
-                with open(f, encoding="utf-8") as fh:
-                    d = json.load(fh)
-            except (OSError, json.JSONDecodeError):
-                continue
-            totals = totals_of(((d.get("record") or {}).get("rows") or {}))
-            if not isinstance(totals, dict):
-                continue
-            sid = os.path.splitext(os.path.basename(f))[0]
-            try:
-                mtime = int(os.path.getmtime(f))
-            except OSError:
-                mtime = 0
-            if mtime >= seen.get(sid, (-1,))[0]:
-                seen[sid] = (mtime, totals)
-
-        for _sid, (mtime, totals) in seen.items():
-            i = totals.get("uncachedInputTokens") or 0
-            o = totals.get("outputTokens") or 0
-            cr = totals.get("cacheReadTokens") or 0
-            cw = totals.get("cacheWriteTokens") or 0
-            u.input += i
-            u.output += o
-            u.cache_read += cr
-            u.cache_write += cw
+        for acc in _dsh_sessions(config).values():
+            u.input += acc[0]
+            u.output += acc[1]
+            u.cache_read += acc[2]
+            u.cache_write += acc[3]
             u.sessions += 1
         u.ok = True
     except Exception as e:                              # noqa: BLE001
@@ -880,47 +1007,27 @@ def collect_codex(config: dict | None = None) -> Usage:
     Every turn appends an event_msg whose payload.info.total_token_usage is a
     CUMULATIVE per-session total, so summing every record would multiply-count.
     Only the largest record in each file is kept.
+
+    These logs are the largest store this app reads (tens of MiB per rollout), so
+    the per-file scan is cached and resumed rather than repeated - see
+    _codex_file_buckets.
     """
     u = Usage(source="Codex")
     root = path_for("codex", config)
     if not os.path.isdir(root):
         u.error = "no ~/.codex/sessions"
+        u.installed = False
         return u
     try:
         for f in glob.glob(os.path.join(root, "**", "*.jsonl"), recursive=True):
-            latest = None
-            try:
-                with open(f, encoding="utf-8", errors="replace") as fh:
-                    for line in fh:
-                        if '"token_count"' not in line:
-                            continue
-                        try:
-                            d = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-                        pl = d.get("payload") or {}
-                        if pl.get("type") != "token_count":
-                            continue
-                        tcu = (pl.get("info") or {}).get("total_token_usage")
-                        if not isinstance(tcu, dict) or "total_tokens" not in tcu:
-                            continue
-                        if latest is None or tcu["total_tokens"] >= latest["total_tokens"]:
-                            latest = tcu
-                            last_ts = d.get("timestamp")
-            except OSError:
-                continue
+            latest = _codex_file_buckets(f)
             if not latest:
                 continue
-            i = latest.get("input_tokens") or 0
-            o = latest.get("output_tokens") or 0
-            cr = latest.get("cached_input_tokens") or 0
-            cw = latest.get("cache_write_input_tokens") or 0
-            rs = latest.get("reasoning_output_tokens") or 0
-            u.input += i
-            u.output += o
-            u.cache_read += cr
-            u.cache_write += cw
-            u.reasoning += rs
+            u.input += latest.get("input_tokens") or 0
+            u.output += latest.get("output_tokens") or 0
+            u.cache_read += latest.get("cached_input_tokens") or 0
+            u.cache_write += latest.get("cache_write_input_tokens") or 0
+            u.reasoning += latest.get("reasoning_output_tokens") or 0
             u.sessions += 1
         u.ok = True
     except Exception as e:                              # noqa: BLE001
@@ -949,6 +1056,7 @@ def collect_claude_code(config: dict | None = None) -> Usage:
     root = path_for("claude_code", config)
     if not os.path.isdir(root):
         u.error = "no ~/.claude/projects"
+        u.installed = False
         return u
 
     keys = ("input_tokens", "output_tokens",
@@ -992,7 +1100,11 @@ def collect_claude_code(config: dict | None = None) -> Usage:
                             s_cr += u_.get("cache_read_input_tokens") or 0
             except OSError:
                 continue
-            if not counted:
+            # A transcript with no usage, or only zero-valued usage records,
+            # holds no consumption. Counting it as a session would make the
+            # panel claim to be reading a session it found nothing in, and would
+            # disagree with the snapshot, which keeps only sessions with tokens.
+            if not counted or not (s_in or s_out or s_cc or s_cr):
                 continue
             u.input += s_in
             u.output += s_out

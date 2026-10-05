@@ -1,6 +1,6 @@
 [project]
 name = "tokenfloats"
-version = "1.0.0"
+version = "1.1.0"
 description = "Tray panel showing live token usage for six AI coding tools"
 readme = "README.md"
 requires-python = ">=3.10"

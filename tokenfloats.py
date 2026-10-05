@@ -23,7 +23,7 @@ import tkinter as tk
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from collectors import (COLLECTORS, Usage, collect_all, detect_all,        # noqa: E402
-                        load_config, totals)
+                        finish_counter, load_config, totals)
 import wineffects as wex                                                # noqa: E402
 
 try:
@@ -44,7 +44,26 @@ except ImportError as e:                                       # pragma: no cove
     raise
 
 APP = "TokenFloatS"
-POLL_SECONDS = 60
+# How often the sources are re-read. Overridable from config.json as
+# {"poll_seconds": 5} - a poll is cheap now that the append-only logs are read
+# incrementally (see collectors._codex_file_buckets), so the default is short.
+# The floor exists because every poll still stats and globs every store: below a
+# couple of seconds that cost stops being worth the responsiveness.
+POLL_SECONDS = 10
+MIN_POLL_SECONDS = 2
+
+
+def poll_seconds(config: dict | None = None) -> int:
+    """Poll interval in seconds: config first, then the default, never below the floor."""
+    cfg = config or {}
+    raw = cfg.get("poll_seconds", cfg.get("interval_seconds"))
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return POLL_SECONDS
+    return max(MIN_POLL_SECONDS, value)
+
+
 W, H = 600, 760            # expanded: width, and a starting height
 W_COLLAPSED = 470          # collapsed bar
 H_COLLAPSED = 76
@@ -372,11 +391,14 @@ def _ctl(parent: tk.Misc, text: str, command, surface: str,
 # panel's alignment between the two columns is deliberate, and a wrapped
 # paragraph would break it.
 RUN_NOTE = (
-    "THIS RUN measures tokens consumed since TokenFloatS was opened. It is the "
-    "difference between each tool's running total now and the total when the app "
-    "started, so it counts new usage only and never re-counts earlier sessions. "
-    "It starts at zero on every launch. TOTAL is each tool's own lifetime "
-    "figure, read straight from its data files."
+    "THIS RUN measures tokens consumed since TokenFloatS was opened: the "
+    "difference between each tool's running total now and its total when the app "
+    "started, so earlier work is not re-counted. It starts at zero on every "
+    "launch. One exception, in the other direction: a conversation you RESUME "
+    "that the tool no longer lists among its sessions is counted in full the "
+    "first time it is seen, so that figure can jump once and then advance "
+    "normally. TOTAL is each tool's own lifetime figure, read straight from its "
+    "data files."
 )
 
 
@@ -1359,7 +1381,7 @@ class Panel(tk.Tk):
                 w["box"].pack_forget()
                 continue
             if not u.ok:
-                if _is_absent(u):
+                if not u.installed:
                     w["box"].pack_forget()
                     continue
                 if not w["box"].winfo_manager():
@@ -1403,6 +1425,10 @@ class TokenFloatS:
         self.stop = False
         self.visible = True
         self.config = config if config is not None else load_config()
+        self.interval = poll_seconds(self.config)
+        # Set on quit so the poll thread stops waiting out its interval at once,
+        # rather than keeping the process alive for up to `interval` seconds.
+        self._stop_event = threading.Event()
 
     def poll_once(self):
         usage = collect_all(self.config)
@@ -1423,10 +1449,10 @@ class TokenFloatS:
                 # a handle with nothing attached, so a poll failure would be
                 # invisible and the panel would silently freeze on stale numbers.
                 _log(f"poll failed: {type(e).__name__}: {e}")
-            for _ in range(POLL_SECONDS * 2):
-                if self.stop:
-                    return
-                time.sleep(0.5)
+            # A single interruptible wait, so quitting never has to drain a
+            # sleep loop and the wake-up costs nothing while idle.
+            if self._stop_event.wait(self.interval):
+                return
 
     def toggle_panel(self, *_):
         if self.panel and self.panel.winfo_exists():
@@ -1450,6 +1476,7 @@ class TokenFloatS:
     def quit(self, *_):
         _log("quit requested from the tray menu")
         self.stop = True
+        self._stop_event.set()          # wake the poll thread out of its wait
         if self.icon:
             self.icon.stop()
         if self.panel and self.panel.winfo_exists():
@@ -1463,9 +1490,14 @@ def main():
     ap.add_argument("--once", action="store_true", help="print a snapshot and exit")
     ap.add_argument("--detect", action="store_true",
                     help="list which source paths were found, then exit")
+    ap.add_argument("--interval", type=int, metavar="SECONDS",
+                    help="poll interval, overriding config.json (minimum "
+                         f"{MIN_POLL_SECONDS})")
     args = ap.parse_args()
 
     cfg = load_config()
+    if args.interval is not None:
+        cfg = {**cfg, "poll_seconds": args.interval}
 
     if args.detect:
         found, missing = detect_all(cfg)
@@ -1503,6 +1535,7 @@ def main():
 
     install_excepthook()
     _log("start")
+    _log(f"poll interval: {poll_seconds(cfg)}s")
     found, missing = detect_all(cfg)
     absent = sorted(k for k in missing if not k.startswith("+also"))
     _log(f"detected {len(found)} source(s); missing: {absent}")
